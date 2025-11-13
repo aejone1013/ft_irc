@@ -1,5 +1,7 @@
 # ft_irc - IRC Server
 
+클로드 체크 리스트 해야함 파트 6
+
 42 School project implementing an IRC server in C++98.
 
 ## Features
