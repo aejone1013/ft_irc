@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <string>
+#include "Server.hpp"
 
 bool isValidPort(const std::string& portStr) {
 	if (portStr.empty())
@@ -36,7 +37,17 @@ int main(int argc, char* argv[]) {
 	}
 	
 	int port = std::atoi(portStr.c_str());
-	std::cout << "Server starting on port " << port << std::endl;
+	
+	try
+	{
+		Server server(port, password);
+		server.start();
+	}
+	catch (const std::exception& e)
+	{
+		std::cerr << "Error: " << e.what() << std::endl;
+		return 1;
+	}
 	
 	return 0;
 }

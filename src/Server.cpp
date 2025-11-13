@@ -1,5 +1,17 @@
 #include "Server.hpp"
 #include "Client.hpp"
+#include "Channel.hpp"
+#include "Message.hpp"
+#include "CommandHandler.hpp"
+#include "PassCommand.hpp"
+#include "JoinCommand.hpp"
+#include "PartCommand.hpp"
+#include "PrivmsgCommand.hpp"
+#include "QuitCommand.hpp"
+#include "KickCommand.hpp"
+#include "TopicCommand.hpp"
+#include "InviteCommand.hpp"
+#include "ModeCommand.hpp"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <fcntl.h>
@@ -11,6 +23,7 @@
 #include <iostream>
 #include <signal.h>
 #include <poll.h>
+#include <cctype>
 
 // Global Server pointer for signal handler
 static Server* g_serverInstance = NULL;
@@ -28,6 +41,7 @@ static void signalHandler(int sig)
 Server::Server(int port, const std::string& password)
 	: _port(port), _password(password), _serverSocket(-1), _isRunning(false)
 {
+	registerCommands();
 }
 
 Server::~Server()
@@ -39,6 +53,22 @@ Server::~Server()
 		close(it->first);
 	}
 	_clients.clear();
+
+	// Cleanup command handlers
+	for (std::map<std::string, CommandHandler*>::iterator it = _commandHandlers.begin(); 
+		 it != _commandHandlers.end(); ++it)
+	{
+		delete it->second;
+	}
+	_commandHandlers.clear();
+
+	// Cleanup channels
+	for (std::map<std::string, Channel*>::iterator it = _channels.begin(); 
+		 it != _channels.end(); ++it)
+	{
+		delete it->second;
+	}
+	_channels.clear();
 
 	// Close server socket
 	if (_serverSocket != -1)
@@ -212,6 +242,16 @@ void Server::start()
 				handleClientMessage(fd);
 			}
 		}
+
+		// Send pending messages to clients
+		for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it)
+		{
+			Client* client = it->second;
+			if (client->hasMessageToSend())
+			{
+				sendToClient(*client);
+			}
+		}
 	}
 
 	// Cleanup
@@ -226,6 +266,17 @@ void Server::stop()
 
 void Server::removeClient(int clientFd)
 {
+	// Remove client from all channels
+	std::vector<Channel*> clientChannels = getChannelsForClient(clientFd);
+	for (std::vector<Channel*>::iterator it = clientChannels.begin(); it != clientChannels.end(); ++it)
+	{
+		(*it)->removeMember(clientFd);
+		if ((*it)->getMemberCount() == 0)
+		{
+			removeChannel((*it)->getName());
+		}
+	}
+
 	// Find and remove client from map
 	std::map<int, Client*>::iterator it = _clients.find(clientFd);
 	if (it != _clients.end())
@@ -250,7 +301,229 @@ void Server::removeClient(int clientFd)
 
 void Server::handleClientMessage(int clientFd)
 {
-	// Placeholder - will be implemented later
-	(void)clientFd;
+	// Find client in map
+	std::map<int, Client*>::iterator it = _clients.find(clientFd);
+	if (it == _clients.end())
+	{
+		std::cerr << "Client not found in map: fd " << clientFd << std::endl;
+		return;
+	}
+
+	Client* client = it->second;
+
+	// Receive data
+	char buffer[512];
+	ssize_t bytesReceived = recv(clientFd, buffer, sizeof(buffer) - 1, 0);
+
+	// Check for connection closed
+	if (bytesReceived == 0)
+	{
+		std::cout << "Client disconnected (recv returned 0): fd " << clientFd << std::endl;
+		removeClient(clientFd);
+		return;
+	}
+
+	// Check for errors
+	if (bytesReceived == -1)
+	{
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+		{
+			// No data available, non-blocking socket
+			return;
+		}
+		std::cerr << "Recv error for client fd " << clientFd << ": " << strerror(errno) << std::endl;
+		removeClient(clientFd);
+		return;
+	}
+
+	// Null-terminate the buffer for safety
+	buffer[bytesReceived] = '\0';
+
+	// Append received data to client's receive buffer
+	std::string receivedData(buffer, bytesReceived);
+	client->appendToRecvBuffer(receivedData);
+
+	// Extract and process complete messages
+	while (true)
+	{
+		std::string messageStr = client->extractMessage();
+		if (messageStr.empty())
+		{
+			// No complete message available
+			break;
+		}
+
+		// Parse message
+		Message msg(messageStr);
+		
+		// Execute command
+		executeCommand(*client, msg);
+	}
+}
+
+void Server::registerCommand(const std::string& cmd, CommandHandler* handler)
+{
+	_commandHandlers[cmd] = handler;
+}
+
+void Server::executeCommand(Client& client, const Message& msg)
+{
+	std::string command = msg.getCommand();
+	if (command.empty())
+	{
+		return;
+	}
+
+	// Lookup command handler
+	std::map<std::string, CommandHandler*>::iterator it = _commandHandlers.find(command);
+	if (it != _commandHandlers.end())
+	{
+		it->second->execute(*this, client, msg);
+	}
+	else
+	{
+		// Unknown command
+		std::string nick = client.getNickname().empty() ? "*" : client.getNickname();
+		std::ostringstream oss;
+		oss << ":irc.server 421 " << nick << " " << command << " :Unknown command\r\n";
+		sendReply(client, oss.str());
+	}
+}
+
+void Server::sendReply(Client& client, const std::string& reply)
+{
+	client.appendToSendBuffer(reply);
+}
+
+const std::string& Server::getPassword() const
+{
+	return _password;
+}
+
+void Server::registerCommands()
+{
+	// Register commands
+	registerCommand("PASS", new PassCommand());
+	registerCommand("JOIN", new JoinCommand());
+	registerCommand("PART", new PartCommand());
+	registerCommand("PRIVMSG", new PrivmsgCommand());
+	registerCommand("QUIT", new QuitCommand());
+	registerCommand("KICK", new KickCommand());
+	registerCommand("TOPIC", new TopicCommand());
+	registerCommand("INVITE", new InviteCommand());
+	registerCommand("MODE", new ModeCommand());
+}
+
+Client* Server::getClientByNickname(const std::string& nickname)
+{
+	for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it)
+	{
+		if (toLowerCase(it->second->getNickname()) == toLowerCase(nickname))
+		{
+			return it->second;
+		}
+	}
+	return NULL;
+}
+
+Channel* Server::getChannel(const std::string& channelName)
+{
+	std::string lowerName = toLowerCase(channelName);
+	std::map<std::string, Channel*>::iterator it = _channels.find(lowerName);
+	if (it != _channels.end())
+	{
+		return it->second;
+	}
+	return NULL;
+}
+
+Channel* Server::createChannel(const std::string& channelName, Client* creator)
+{
+	std::string lowerName = toLowerCase(channelName);
+	Channel* channel = new Channel(channelName, creator);
+	_channels[lowerName] = channel;
+	return channel;
+}
+
+void Server::removeChannel(const std::string& channelName)
+{
+	std::string lowerName = toLowerCase(channelName);
+	std::map<std::string, Channel*>::iterator it = _channels.find(lowerName);
+	if (it != _channels.end())
+	{
+		delete it->second;
+		_channels.erase(it);
+	}
+}
+
+std::vector<Channel*> Server::getChannelsForClient(int clientFd)
+{
+	std::vector<Channel*> result;
+	for (std::map<std::string, Channel*>::iterator it = _channels.begin(); it != _channels.end(); ++it)
+	{
+		if (it->second->isMember(clientFd))
+		{
+			result.push_back(it->second);
+		}
+	}
+	return result;
+}
+
+bool Server::isValidChannelName(const std::string& name) const
+{
+	if (name.empty() || name[0] != '#')
+	{
+		return false;
+	}
+	if (name.length() < 2 || name.length() > 50)
+	{
+		return false;
+	}
+	return true;
+}
+
+std::string Server::toLowerCase(const std::string& str) const
+{
+	std::string result = str;
+	for (std::string::size_type i = 0; i < result.length(); ++i)
+	{
+		result[i] = std::tolower(result[i]);
+	}
+	return result;
+}
+
+void Server::sendToClient(Client& client)
+{
+	std::string sendBuffer = client.getSendBuffer();
+	if (sendBuffer.empty())
+	{
+		return;
+	}
+
+	int clientFd = client.getFd();
+	ssize_t bytesSent = send(clientFd, sendBuffer.c_str(), sendBuffer.length(), 0);
+
+	if (bytesSent == -1)
+	{
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			std::cerr << "Send error for client fd " << clientFd << ": " << strerror(errno) << std::endl;
+			removeClient(clientFd);
+			return;
+		}
+		// Would block, keep data in buffer for next attempt
+		return;
+	}
+
+	// Remove sent data from buffer
+	if (bytesSent > 0)
+	{
+		std::string remaining = sendBuffer.substr(bytesSent);
+		client.clearSendBuffer();
+		if (!remaining.empty())
+		{
+			client.appendToSendBuffer(remaining);
+		}
+	}
 }
 

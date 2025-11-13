@@ -15,7 +15,7 @@ INC_DIR = include
 TARGET = ircserv
 
 # Source files
-SRCS = $(wildcard $(SRC_DIR)/*.cpp)
+SRCS = $(wildcard $(SRC_DIR)/*.cpp) $(wildcard $(SRC_DIR)/commands/*.cpp)
 OBJS = $(SRCS:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 
 # Default target
@@ -28,6 +28,7 @@ $(TARGET): $(OBJS)
 # Compile source files to object files
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(OBJ_DIR)
+	@mkdir -p $(OBJ_DIR)/commands
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # Clean object files
@@ -41,5 +42,10 @@ fclean: clean
 # Rebuild everything
 re: fclean all
 
-.PHONY: all clean fclean re
+# Valgrind memory check
+valgrind: $(TARGET)
+	valgrind --leak-check=full --show-leak-kinds=all --track-fds=yes \
+	./$(TARGET) 6667 test
+
+.PHONY: all clean fclean re valgrind
 
